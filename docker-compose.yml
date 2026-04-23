@@ -11,6 +11,7 @@ services:
     volumes:
       - ./painel:/app/painel:ro
       - ./fotos:/app/fotos
+      - ./audios:/app/audios
 
 networks:
   rifabot:

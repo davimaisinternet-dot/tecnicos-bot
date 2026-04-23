@@ -31,6 +31,7 @@ tr:hover td { background:rgba(0,216,255,.03); }
 .tipo-instalacao { color:var(--green); }
 .tipo-troca { color:var(--amber); }
 .tipo-manutencao { color:var(--cyan); }
+.tipo-recolhimento { color:var(--red); }
 .tipo-outros { color:var(--text-dim); }
 .mono { font-family:var(--fm); color:var(--cyan); font-size:11px; }
 .serial { font-family:var(--fm); color:var(--amber); font-size:11px; }
@@ -49,6 +50,7 @@ tr:hover td { background:rgba(0,216,255,.03); }
   <div class="card"><div class="lbl">INSTALAÇÕES</div><div class="val tipo-instalacao" id="s-inst">—</div></div>
   <div class="card"><div class="lbl">TROCAS</div><div class="val tipo-troca" id="s-troca">—</div></div>
   <div class="card"><div class="lbl">MANUTENÇÕES</div><div class="val tipo-manutencao" id="s-mant">—</div></div>
+  <div class="card"><div class="lbl">RECOLHIMENTOS</div><div class="val tipo-recolhimento" id="s-recol">—</div></div>
   <div class="card"><div class="lbl">HOJE</div><div class="val" id="s-hoje">—</div></div>
   <div class="card"><div class="lbl">TÉCNICOS ATIVOS</div><div class="val" id="s-tec" style="color:var(--amber)">—</div></div>
 </div>
@@ -60,6 +62,7 @@ tr:hover td { background:rgba(0,216,255,.03); }
     <option value="instalacao">Instalação</option>
     <option value="troca">Troca</option>
     <option value="manutencao">Manutenção</option>
+    <option value="recolhimento">Recolhimento</option>
     <option value="outros">Outros</option>
   </select>
   <select id="f-tecnico">
@@ -122,6 +125,7 @@ function updateStats(list) {
   document.getElementById('s-inst').textContent  = list.filter(e=>e.tipo==='instalacao').length;
   document.getElementById('s-troca').textContent = list.filter(e=>e.tipo==='troca').length;
   document.getElementById('s-mant').textContent  = list.filter(e=>e.tipo==='manutencao').length;
+  document.getElementById('s-recol').textContent = list.filter(e=>e.tipo==='recolhimento').length;
   const hoje = new Date().toISOString().slice(0,10);
   document.getElementById('s-hoje').textContent  = list.filter(e=>e.received_at.startsWith(hoje)).length;
   const tecnicos = [...new Set(list.map(e=>e.tecnico_nome).filter(Boolean))];

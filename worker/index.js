@@ -9,7 +9,10 @@ const WPP_SESSION     = process.env.WPP_SESSION     || "rifa-bot";
 const WPP_SECRET      = process.env.WPP_SECRET      || "MAISINTERNET_SUPER_SECRET";
 const GEMINI_KEY      = process.env.GEMINI_KEY      || "";
 const GEMINI_MODEL    = process.env.GEMINI_MODEL    || "gemini-2.0-flash";
-const GESPROV_URL     = process.env.GESPROV_URL     || "";   // ex: http://genius-acs:8080
+const GESPROV_URL     = process.env.GESPROV_URL     || "";   // ACS Panel (proxy Gesprov)
+const GESPROV_USER    = process.env.GESPROV_USER    || "admin";
+const GESPROV_PASS    = process.env.GESPROV_PASS    || "admin";
+const GENIEACS_NBI    = process.env.GENIEACS_NBI    || "";   // ex: http://10.64.10.51:7557
 const REPLY_ON_GROUP  = (process.env.REPLY_ON_GROUP || "true") === "true";
 
 const pool = new pg.Pool({
@@ -46,11 +49,13 @@ async function wppSendText(chatId, text) {
 
 // --- Gemini Vision + NLP ---
 const PROMPT = `Voce e um assistente que extrai dados de uma mensagem do WhatsApp de tecnicos de ISP.
-Pode vir com uma foto de equipamento (roteador, ONT/ONU) e um texto descritivo.
+Pode vir com: uma foto de equipamento (roteador, ONT/ONU), um AUDIO do tecnico descrevendo a acao (transcreva e interprete) OU um texto.
 
-Extraia em JSON EXATO com esses campos (use null quando nao tiver):
+Extraia em JSON EXATO com esses campos:
 {
-  "tipo": "instalacao" | "troca" | "manutencao" | "outros",
+  "ignorar": boolean,
+  "motivo_ignorar": string|null,
+  "tipo": "instalacao" | "troca" | "manutencao" | "recolhimento" | "outros",
   "cliente_nome": string|null,
   "cliente_cpf": string|null,
   "cliente_login": string|null,
@@ -63,19 +68,42 @@ Extraia em JSON EXATO com esses campos (use null quando nao tiver):
   "observacoes": string|null
 }
 
-Regras:
-- Serial (SN) e MAC sao impressos na etiqueta do equipamento. NAO invente valores.
-- MAC tem formato AA:BB:CC:DD:EE:FF ou AABBCCDDEEFF.
-- Se o texto disser "troca" ou "trocou" ou "substituicao" -> tipo=troca.
-- Se "instalacao" ou "novo cliente" -> tipo=instalacao.
-- Se "manutencao" ou "visita" ou "problema" -> tipo=manutencao.
-- Responda SOMENTE com o JSON, sem markdown, sem explicacoes.`;
+ANTES DE TUDO, avalie se a mensagem é sobre INSTALACAO/MANUTENCAO de equipamento (alvo do sistema) OU outra coisa (ruido).
 
-async function geminiExtract({ text, imageBase64, imageMime }) {
+Se a foto/texto for:
+- Comprovante de pagamento (Pix, recibo bancario, transferencia)
+- Print de tela de chat/conversa
+- Selfie / pessoa / meme / sticker
+- Documento pessoal (RG, CPF, contrato) sem equipamento
+- Foto de rua/casa sem equipamento visivel
+- Mensagem generica (bom dia, agradecimento, piada)
+- Registro de jornada/ponto: foto de painel de carro, odometro, velocimetro, km, "chegada" ou "saida" de veiculo, inicio/fim de expediente, registro de trajeto com Timemark
+- Foto de almoco/comida/refeicao/pausa
+
+-> defina ignorar=true e motivo_ignorar explicando brevemente (ex: "comprovante de pagamento Pix", "selfie", "registro de chegada/saida do veiculo", "mensagem generica"). Deixe os outros campos null.
+
+Se a foto/texto for sobre equipamento de rede (ONT, ONU, roteador, switch) ou menciona acao de instalacao/troca/manutencao/recolhimento -> ignorar=false e preencha o resto.
+
+Regras quando ignorar=false:
+- Serial (SN) e MAC sao impressos na etiqueta. NAO invente.
+- MAC formato AA:BB:CC:DD:EE:FF ou AABBCCDDEEFF.
+- "recolhimento" / "recolhido" / "retirada" / "cancelamento" / "baixa no sistema" / "nao dá baixa" -> tipo=recolhimento.
+- "troca" / "trocou" / "substituicao" -> tipo=troca.
+- "instalacao" / "novo cliente" / "instalei" -> tipo=instalacao.
+- "manutencao" / "visita" / "problema" / "defeito" -> tipo=manutencao.
+- Em recolhimento, motivo (inadimplencia/cancelamento) vai em observacoes.
+- Capture cliente_nome mesmo em frase corrida.
+- CPF: qualquer sequencia de 11 digitos (sem formatacao). NAO confunda CPF do cliente com CPF/CNPJ do ISP em comprovante.
+- cliente_login: palavra antes de "@" ou apos "login"/"usuario".
+
+Responda SOMENTE com o JSON, sem markdown, sem explicacoes.`;
+
+async function geminiExtract({ text, imageBase64, imageMime, audioBase64, audioMime }) {
   if (!GEMINI_KEY) throw new Error("GEMINI_KEY ausente");
   const parts = [{ text: PROMPT }];
   if (text) parts.push({ text: `\n\nTexto da mensagem:\n${text}` });
   if (imageBase64) parts.push({ inline_data: { mime_type: imageMime || "image/jpeg", data: imageBase64 } });
+  if (audioBase64) parts.push({ inline_data: { mime_type: audioMime || "audio/ogg", data: audioBase64 } });
 
   const models = [GEMINI_MODEL, "gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash"];
   const seen = new Set();
@@ -118,14 +146,80 @@ async function geminiExtract({ text, imageBase64, imageMime }) {
   return { raw: "{}", parsed: {} };
 }
 
-// --- Gesprov (opcional) ---
+// --- Helpers ---
+function normalizeMac(mac) {
+  if (!mac) return null;
+  const clean = String(mac).replace(/[^0-9A-Fa-f]/g, "").toUpperCase();
+  if (clean.length !== 12) return mac; // nao parece MAC valido, preserva
+  return clean.match(/.{2}/g).join(":");
+}
+
+// --- ACS Panel token cache ---
+let acsToken = null, acsTokenAt = 0;
+async function acsPanelToken() {
+  if (acsToken && Date.now() - acsTokenAt < 30 * 60 * 1000) return acsToken;
+  try {
+    const r = await fetch(`${GESPROV_URL}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: GESPROV_USER, password: GESPROV_PASS }),
+    });
+    const j = await r.json();
+    acsToken = j.token;
+    acsTokenAt = Date.now();
+    return acsToken;
+  } catch (e) { console.error("acs-panel login fail:", e.message); return null; }
+}
+
+// --- Gesprov lookup (via ACS Panel) ---
 async function gesprovLookup(query) {
   if (!GESPROV_URL || !query) return null;
   try {
-    const r = await fetch(`${GESPROV_URL}/api/gesprov/${encodeURIComponent(query)}`, { timeout: 5000 });
+    const token = await acsPanelToken();
+    if (!token) return null;
+    const r = await fetch(`${GESPROV_URL}/api/gesprov/${encodeURIComponent(query)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     if (!r.ok) return null;
     return r.json();
-  } catch { return null; }
+  } catch (e) { console.error("gesprov fail:", e.message); return null; }
+}
+
+// --- GenieACS lookup: busca CPE por serial OU MAC ---
+async function genieacsLookup({ serial, mac }) {
+  if (!GENIEACS_NBI) return null;
+  const tryQueries = [];
+  if (serial) tryQueries.push({ serial }, { id_contains: serial });
+  if (mac) {
+    const macClean = mac.replace(/[^0-9A-Fa-f]/g, "").toUpperCase();
+    tryQueries.push({ mac: macClean }, { id_contains: macClean });
+  }
+  for (const q of tryQueries) {
+    try {
+      // GenieACS NBI aceita query em JSON
+      let mongoQuery = {};
+      if (q.serial) mongoQuery["DeviceID.SerialNumber._value"] = q.serial;
+      else if (q.mac) mongoQuery["InternetGatewayDevice.LANDevice.1.LANEthernetInterfaceConfig.1.MACAddress._value"] = q.mac;
+      else if (q.id_contains) mongoQuery["_id"] = { "$regex": q.id_contains };
+
+      const url = `${GENIEACS_NBI}/devices?query=${encodeURIComponent(JSON.stringify(mongoQuery))}&projection=_id,_lastInform,_registered,InternetGatewayDevice.DeviceInfo.ModelName,InternetGatewayDevice.DeviceInfo.SerialNumber,InternetGatewayDevice.DeviceInfo.SoftwareVersion,InternetGatewayDevice.WANDevice`;
+      const r = await fetch(url);
+      if (!r.ok) continue;
+      const arr = await r.json();
+      if (Array.isArray(arr) && arr.length > 0) {
+        const d = arr[0];
+        return {
+          device_id: d._id,
+          last_inform: d._lastInform,
+          registered: d._registered,
+          model: d.InternetGatewayDevice?.DeviceInfo?.ModelName?._value,
+          serial_acs: d.InternetGatewayDevice?.DeviceInfo?.SerialNumber?._value,
+          firmware: d.InternetGatewayDevice?.DeviceInfo?.SoftwareVersion?._value,
+        };
+      }
+    } catch (e) { console.error("genieacs fail:", e.message); }
+  }
+  return null;
 }
 
 // --- Persistir evento ---
@@ -231,55 +325,82 @@ app.post("/webhook", async (req, res) => {
   const tecnicoNumero = msg.sender?.id?._serialized || msg.sender?.id || msg.author || "";
   const tecnicoNome = msg.sender?.pushname || msg.sender?.name || msg.notifyName || "";
   const mimetype = msg.mimetype || "";
-  const hasMedia = !!msg.isMedia || !!msg.isMMS || msg.type === "image" || !!msg.mimetype;
+  const hasMedia = !!msg.isMedia || !!msg.isMMS || msg.type === "image" || msg.type === "audio" || msg.type === "ptt" || !!msg.mimetype;
   const isImage = hasMedia && mimetype.startsWith("image/");
+  const isAudio = hasMedia && mimetype.startsWith("audio/");
 
-  // Quando tem midia, o body eh base64 da imagem. A legenda vai em caption/content.
-  let imageBase64 = null;
-  let imageMime = null;
-  let fotoFilename = null;
+  let imageBase64 = null, imageMime = null, fotoFilename = null;
+  let audioBase64 = null, audioMime = null, audioFilename = null;
   let text = "";
-  if (isImage) {
-    imageMime = mimetype;
-    imageBase64 = msg.body; // base64 da foto
-    // Legenda vem em caption/content. NAO usar msg.text aqui porque frequentemente contem o proprio base64.
-    text = msg.caption || msg.content || "";
-    if (!imageBase64 || imageBase64.length < 500) {
+
+  async function loadMediaB64() {
+    let b64 = msg.body;
+    if (!b64 || b64.length < 500) {
       try {
         const dl = await wppCall("/download-media", { messageId });
-        if (dl?.base64) imageBase64 = dl.base64;
+        if (dl?.base64) b64 = dl.base64;
       } catch (e) { console.error("download fail:", e.message); }
     }
-    // Salvar foto em disco pra audit
+    return b64;
+  }
+
+  const fs = await import("node:fs/promises");
+
+  if (isImage) {
+    imageMime = mimetype;
+    imageBase64 = await loadMediaB64();
+    text = msg.caption || msg.content || "";
     try {
-      const fs = await import("node:fs/promises");
       await fs.mkdir("/app/fotos", { recursive: true });
       const ext = (mimetype.split("/")[1] || "jpg").split(";")[0];
       fotoFilename = `${Date.now()}_${messageId.replace(/[^a-zA-Z0-9]/g,"_").slice(0,40)}.${ext}`;
       await fs.writeFile(`/app/fotos/${fotoFilename}`, Buffer.from(imageBase64, "base64"));
-      console.log(`[FOTO] salva /app/fotos/${fotoFilename} (${imageBase64.length}b)`);
+      console.log(`[FOTO] /app/fotos/${fotoFilename} (${imageBase64.length}b)`);
     } catch (e) { console.error("save photo fail:", e.message); }
+  } else if (isAudio) {
+    audioMime = mimetype;
+    audioBase64 = await loadMediaB64();
+    text = msg.caption || msg.content || "";
+    try {
+      await fs.mkdir("/app/audios", { recursive: true });
+      const ext = (mimetype.split("/")[1] || "ogg").split(";")[0];
+      audioFilename = `${Date.now()}_${messageId.replace(/[^a-zA-Z0-9]/g,"_").slice(0,40)}.${ext}`;
+      await fs.writeFile(`/app/audios/${audioFilename}`, Buffer.from(audioBase64, "base64"));
+      console.log(`[AUDIO] /app/audios/${audioFilename} (${audioBase64.length}b)`);
+    } catch (e) { console.error("save audio fail:", e.message); }
   } else {
     text = msg.body || msg.content || "";
   }
 
-  console.log(`[MSG] ${tecnicoNumero} (${tecnicoNome}): text="${text.slice(0,80)}" image=${isImage} b64len=${imageBase64?.length||0}`);
+  console.log(`[MSG] ${tecnicoNumero} (${tecnicoNome}): text="${text.slice(0,80)}" img=${isImage} audio=${isAudio}`);
 
-  // so chama Gemini se tem foto OU texto com keyword
-  const shouldProcess = isImage || /instala|troca|manuten|onu|ont|roteador/i.test(text);
+  const shouldProcess = isImage || isAudio || /instala|troca|manuten|recolh|onu|ont|roteador/i.test(text);
   if (!shouldProcess) return;
 
   let ai = { raw: null, parsed: {} };
   try {
-    ai = await geminiExtract({ text, imageBase64, imageMime });
+    ai = await geminiExtract({ text, imageBase64, imageMime, audioBase64, audioMime });
   } catch (e) { console.error("gemini fail:", e.message); }
 
   const p = ai.parsed || {};
 
-  // Gesprov lookup por CPF, login ou nome
+  // Filtro de ruido: comprovantes, selfies, memes, etc
+  if (p.ignorar === true) {
+    console.log(`[IGNORADO] motivo=${p.motivo_ignorar || "?"} text="${text.slice(0,60)}"`);
+    return; // nao salva, nao responde
+  }
+
+  // Gesprov lookup: prioriza CPF, login, depois nome (nome pode nao retornar)
   let gesprov = null;
-  const query = p.cliente_cpf || p.cliente_login || p.cliente_nome;
-  if (query) gesprov = await gesprovLookup(query);
+  for (const q of [p.cliente_cpf, p.cliente_login].filter(Boolean)) {
+    gesprov = await gesprovLookup(q);
+    if (gesprov?.nome) break;
+  }
+
+  // GenieACS lookup: busca CPE pelo serial/mac
+  const macNorm = normalizeMac(p.mac);
+  let acsInfo = null;
+  if (p.serial || macNorm) acsInfo = await genieacsLookup({ serial: p.serial, mac: macNorm });
 
   const ev = {
     message_id: messageId,
@@ -288,19 +409,20 @@ app.post("/webhook", async (req, res) => {
     tecnico_nome: tecnicoNome,
     raw_text: text,
     tipo: p.tipo || null,
-    cliente_nome: p.cliente_nome || gesprov?.nome || null,
-    cliente_cpf: p.cliente_cpf || gesprov?.cpf || null,
+    // Gesprov tem prioridade no nome/cpf (dados oficiais)
+    cliente_nome: gesprov?.nome || p.cliente_nome || null,
+    cliente_cpf: gesprov?.cpf || p.cliente_cpf || null,
     cliente_login: p.cliente_login || null,
     equipamento: p.equipamento || null,
     fabricante: p.fabricante || null,
     modelo: p.modelo || null,
     serial: p.serial || null,
-    mac: p.mac || null,
+    mac: macNorm || null,
     equip_anterior: p.equip_anterior || null,
     observacoes: p.observacoes || null,
     foto_filename: fotoFilename,
     foto_mime: imageMime,
-    ai_raw_json: ai.parsed,
+    ai_raw_json: { ...ai.parsed, _genieacs: acsInfo },
     gesprov_cliente: gesprov,
   };
 
@@ -312,10 +434,25 @@ app.post("/webhook", async (req, res) => {
       const parts = [];
       parts.push(`✅ Registrado #${id}`);
       if (ev.tipo) parts.push(`Tipo: *${ev.tipo}*`);
-      if (ev.cliente_nome) parts.push(`Cliente: ${ev.cliente_nome}`);
+      if (ev.cliente_nome) {
+        const suffix = gesprov?.nome ? " ✓" : "";
+        parts.push(`Cliente: ${ev.cliente_nome}${suffix}`);
+      }
+      if (ev.cliente_cpf) parts.push(`CPF: ${ev.cliente_cpf}`);
+      if (ev.cliente_login) parts.push(`Login: ${ev.cliente_login}`);
+      if (gesprov?.plano) parts.push(`Plano: ${gesprov.plano} (${gesprov.situacao || "?"})`);
+      if (gesprov?.endereco) parts.push(`Endereço: ${gesprov.endereco}`);
       if (ev.fabricante || ev.modelo) parts.push(`${[ev.fabricante, ev.modelo].filter(Boolean).join(" ")}`);
       if (ev.serial) parts.push(`SN: \`${ev.serial}\``);
       if (ev.mac) parts.push(`MAC: \`${ev.mac}\``);
+      if (acsInfo?.device_id) {
+        const last = acsInfo.last_inform ? new Date(acsInfo.last_inform).toLocaleString("pt-BR") : "?";
+        parts.push(`ACS: _já provisionado (último inform ${last})_`);
+      }
+      if (ev.observacoes) parts.push(`Obs: ${ev.observacoes}`);
+      if (ev.cliente_nome && !ev.cliente_cpf && !ev.cliente_login) {
+        parts.push(`\n💡 _Dica: inclua CPF ou login PPPoE pra enriquecer com dados do sistema._`);
+      }
       await wppSendText(CHAT_ID, parts.join("\n"));
     }
   } catch (e) { console.error("save fail:", e.message); }

@@ -1,0 +1,5 @@
+.env
+fotos/
+node_modules/
+*.log
+dispatcher_index.js.bak*

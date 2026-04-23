@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Registro de Instalações · MaisInternet</title>
+<style>
+:root {
+  --bg:#0a1628; --bg2:#0d1b2e; --bg3:#12263f; --border:#0c2d4e; --border-br:#164770;
+  --text:#b8d4e8; --text-dim:#6a89a5; --text-br:#e0ecf5; --cyan:#00d8ff; --green:#00ff99;
+  --amber:#ffb347; --red:#ff4060; --fm:'JetBrains Mono',monospace; --fh:'JetBrains Mono',monospace; --r:8px;
+}
+* { box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:var(--fm); margin:0; padding:24px 28px; }
+h1 { color:var(--cyan); font-size:20px; letter-spacing:3px; margin:0 0 6px; }
+.sub { color:var(--text-dim); font-size:11px; letter-spacing:2px; margin-bottom:20px; }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; margin-bottom:22px; }
+.card { background:var(--bg2); border:1px solid var(--border); border-radius:var(--r); padding:14px 18px; }
+.card .lbl { color:var(--text-dim); font-size:10px; letter-spacing:2px; margin-bottom:6px; }
+.card .val { color:var(--text-br); font-size:28px; font-weight:600; }
+.filters { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:14px; }
+.filters input, .filters select {
+  background:var(--bg2); border:1px solid var(--border); color:var(--text-br);
+  font-family:var(--fm); font-size:13px; padding:8px 12px; border-radius:var(--r); outline:none;
+}
+.filters input:focus, .filters select:focus { border-color:var(--cyan); }
+table { width:100%; border-collapse:collapse; font-size:12px; background:var(--bg2); border-radius:var(--r); overflow:hidden; border:1px solid var(--border); }
+th { padding:10px 12px; text-align:left; color:var(--text-dim); font-size:10px; letter-spacing:1.5px; background:var(--bg3); font-weight:500; }
+td { padding:10px 12px; border-top:1px solid rgba(12,45,78,.6); vertical-align:top; }
+tr:hover td { background:rgba(0,216,255,.03); }
+.tipo-instalacao { color:var(--green); }
+.tipo-troca { color:var(--amber); }
+.tipo-manutencao { color:var(--cyan); }
+.tipo-outros { color:var(--text-dim); }
+.mono { font-family:var(--fm); color:var(--cyan); font-size:11px; }
+.serial { font-family:var(--fm); color:var(--amber); font-size:11px; }
+.tec { color:var(--text-dim); font-size:10px; }
+</style>
+</head>
+<body>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+  <h1>REGISTRO DE INSTALAÇÕES</h1>
+  <a id="btn-export" href="/api/export.csv" style="background:var(--green);color:var(--bg);padding:10px 18px;border-radius:var(--r);font-family:var(--fm);font-size:12px;letter-spacing:2px;font-weight:600;text-decoration:none;border:none;cursor:pointer">⬇ EXPORTAR EXCEL</a>
+</div>
+<div class="sub">MaisInternet · Bot WhatsApp · Equipe Técnica</div>
+
+<div class="stats">
+  <div class="card"><div class="lbl">TOTAL</div><div class="val" id="s-total">—</div></div>
+  <div class="card"><div class="lbl">INSTALAÇÕES</div><div class="val tipo-instalacao" id="s-inst">—</div></div>
+  <div class="card"><div class="lbl">TROCAS</div><div class="val tipo-troca" id="s-troca">—</div></div>
+  <div class="card"><div class="lbl">MANUTENÇÕES</div><div class="val tipo-manutencao" id="s-mant">—</div></div>
+  <div class="card"><div class="lbl">HOJE</div><div class="val" id="s-hoje">—</div></div>
+  <div class="card"><div class="lbl">TÉCNICOS ATIVOS</div><div class="val" id="s-tec" style="color:var(--amber)">—</div></div>
+</div>
+
+<div class="filters">
+  <input id="f-search" placeholder="Buscar cliente, serial, modelo..." style="flex:1;min-width:200px">
+  <select id="f-tipo">
+    <option value="">Todos os tipos</option>
+    <option value="instalacao">Instalação</option>
+    <option value="troca">Troca</option>
+    <option value="manutencao">Manutenção</option>
+    <option value="outros">Outros</option>
+  </select>
+  <select id="f-tecnico">
+    <option value="">Todos os técnicos</option>
+  </select>
+  <input type="date" id="f-data">
+</div>
+
+<table>
+<thead><tr>
+  <th>DATA</th><th>TÉCNICO</th><th>TIPO</th><th>CLIENTE</th><th>EQUIPAMENTO</th><th>MODELO</th><th>SERIAL</th><th>MAC</th><th>OBS</th>
+</tr></thead>
+<tbody id="rows"><tr><td colspan="9" style="text-align:center;padding:30px;color:var(--text-dim)">Carregando...</td></tr></tbody>
+</table>
+
+<script>
+let ALL = [];
+function fmtDt(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+}
+function esc(s) { return (s==null?'':String(s)).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+function render(list) {
+  const tbody = document.getElementById('rows');
+  if (!list.length) { tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:30px;color:var(--text-dim)">Nenhum registro</td></tr>'; return; }
+  tbody.innerHTML = list.map(e => `
+    <tr>
+      <td>${fmtDt(e.received_at)}</td>
+      <td style="color:var(--amber);font-weight:500">${esc(e.tecnico_nome||'—')}<div class="tec">${esc((e.tecnico_numero||'').replace(/@.*/,''))}</div></td>
+      <td class="tipo-${e.tipo||'outros'}">${esc(e.tipo||'—')}</td>
+      <td>${esc(e.cliente_nome||'—')}<div class="tec">${esc(e.cliente_login||e.cliente_cpf||'')}</div></td>
+      <td>${esc(e.equipamento||'—')}<div class="tec">${esc(e.fabricante||'')}</div></td>
+      <td>${esc(e.modelo||'—')}</td>
+      <td class="serial">${esc(e.serial||'—')}</td>
+      <td class="mono">${esc(e.mac||'—')}</td>
+      <td>${esc(e.observacoes||'')}</td>
+    </tr>`).join('');
+}
+function applyFilters() {
+  const q = document.getElementById('f-search').value.toLowerCase();
+  const t = document.getElementById('f-tipo').value;
+  const tec = document.getElementById('f-tecnico').value;
+  const d = document.getElementById('f-data').value;
+  const filtered = ALL.filter(e => {
+    if (t && e.tipo !== t) return false;
+    if (tec && (e.tecnico_nome || '') !== tec) return false;
+    if (d && !e.received_at.startsWith(d)) return false;
+    if (q) {
+      const hay = [e.cliente_nome,e.cliente_login,e.serial,e.modelo,e.fabricante,e.mac,e.raw_text,e.tecnico_nome].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  render(filtered);
+}
+['f-search','f-tipo','f-tecnico','f-data'].forEach(id => document.getElementById(id).addEventListener('input',applyFilters));
+
+function updateStats(list) {
+  document.getElementById('s-total').textContent = list.length;
+  document.getElementById('s-inst').textContent  = list.filter(e=>e.tipo==='instalacao').length;
+  document.getElementById('s-troca').textContent = list.filter(e=>e.tipo==='troca').length;
+  document.getElementById('s-mant').textContent  = list.filter(e=>e.tipo==='manutencao').length;
+  const hoje = new Date().toISOString().slice(0,10);
+  document.getElementById('s-hoje').textContent  = list.filter(e=>e.received_at.startsWith(hoje)).length;
+  const tecnicos = [...new Set(list.map(e=>e.tecnico_nome).filter(Boolean))];
+  document.getElementById('s-tec').textContent = tecnicos.length;
+  // popula select
+  const sel = document.getElementById('f-tecnico');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">Todos os técnicos</option>' + tecnicos.sort().map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join('');
+  sel.value = current;
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/eventos');
+    ALL = await r.json();
+    updateStats(ALL);
+    applyFilters();
+  } catch (e) {
+    document.getElementById('rows').innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--red)">Erro ao carregar</td></tr>';
+  }
+}
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>

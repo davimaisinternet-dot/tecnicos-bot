@@ -1,0 +1,18 @@
+services:
+  worker:
+    build: ./worker
+    container_name: tecnicos-bot
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - rifabot
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./painel:/app/painel:ro
+      - ./fotos:/app/fotos
+
+networks:
+  rifabot:
+    external: true
+    name: telegram-rifa-bot_default

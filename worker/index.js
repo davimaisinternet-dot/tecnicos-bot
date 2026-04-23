@@ -14,6 +14,7 @@ const GESPROV_USER    = process.env.GESPROV_USER    || "admin";
 const GESPROV_PASS    = process.env.GESPROV_PASS    || "admin";
 const GENIEACS_NBI    = process.env.GENIEACS_NBI    || "";   // ex: http://10.64.10.51:7557
 const REPLY_ON_GROUP  = (process.env.REPLY_ON_GROUP || "true") === "true";
+const DEBOUNCE_MS     = Number(process.env.DEBOUNCE_MS || 60000); // consolida msgs do mesmo tecnico em 60s
 
 const pool = new pg.Pool({
   host: process.env.PGHOST || "postgres",
@@ -311,6 +312,154 @@ app.get("/api/export.csv", async (_req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// --- Fila debounce por tecnico: consolida audio+foto+texto em 1 registro ---
+const pending = new Map(); // tecnico_numero -> { msgs: [], timer, tecnico_nome }
+
+function scheduleProcess(tecnicoNumero, tecnicoNome) {
+  const entry = pending.get(tecnicoNumero);
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.tecnico_nome = tecnicoNome || entry.tecnico_nome;
+  entry.timer = setTimeout(() => processBatch(tecnicoNumero).catch(e => console.error("batch err:", e.message)), DEBOUNCE_MS);
+}
+
+async function processBatch(tecnicoNumero) {
+  const entry = pending.get(tecnicoNumero);
+  if (!entry) return;
+  pending.delete(tecnicoNumero);
+  const { msgs, tecnico_nome } = entry;
+  if (!msgs.length) return;
+
+  const texts = msgs.map(m => m.text).filter(Boolean);
+  const images = msgs.filter(m => m.imageBase64).slice(0, 3); // max 3 fotos
+  const audios = msgs.filter(m => m.audioBase64).slice(0, 2); // max 2 audios
+  const textJoined = texts.join("\n---\n");
+  const messageIds = msgs.map(m => m.messageId);
+  const fotoFilenames = msgs.map(m => m.fotoFilename).filter(Boolean);
+  const audioFilenames = msgs.map(m => m.audioFilename).filter(Boolean);
+
+  console.log(`[BATCH] ${tecnicoNumero} (${tecnico_nome}): ${msgs.length} msgs | texts=${texts.length} imgs=${images.length} audios=${audios.length}`);
+
+  // Gemini: envia TODAS imagens + TODOS audios numa unica call
+  let ai = { raw: null, parsed: {} };
+  try {
+    ai = await geminiExtractBatch({ text: textJoined, images, audios });
+  } catch (e) { console.error("gemini fail:", e.message); }
+
+  const p = ai.parsed || {};
+
+  if (p.ignorar === true) {
+    console.log(`[IGNORADO] motivo=${p.motivo_ignorar || "?"}`);
+    return;
+  }
+
+  let gesprov = null;
+  for (const q of [p.cliente_cpf, p.cliente_login].filter(Boolean)) {
+    gesprov = await gesprovLookup(q);
+    if (gesprov?.nome) break;
+  }
+
+  const macNorm = normalizeMac(p.mac);
+  let acsInfo = null;
+  if (p.serial || macNorm) acsInfo = await genieacsLookup({ serial: p.serial, mac: macNorm });
+
+  const ev = {
+    message_id: messageIds[0], // usa o primeiro id (deduplica se re-processar)
+    chat_id: CHAT_ID,
+    tecnico_numero: tecnicoNumero,
+    tecnico_nome: tecnico_nome,
+    raw_text: textJoined,
+    tipo: p.tipo || null,
+    cliente_nome: gesprov?.nome || p.cliente_nome || null,
+    cliente_cpf: gesprov?.cpf || p.cliente_cpf || null,
+    cliente_login: p.cliente_login || null,
+    equipamento: p.equipamento || null,
+    fabricante: p.fabricante || null,
+    modelo: p.modelo || null,
+    serial: p.serial || null,
+    mac: macNorm || null,
+    equip_anterior: p.equip_anterior || null,
+    observacoes: p.observacoes || null,
+    foto_filename: fotoFilenames.join(",") || null,
+    foto_mime: images[0]?.imageMime || null,
+    ai_raw_json: { ...ai.parsed, _genieacs: acsInfo, _batch: { msgs: msgs.length, images: images.length, audios: audios.length, fotos: fotoFilenames, audioFiles: audioFilenames } },
+    gesprov_cliente: gesprov,
+  };
+
+  try {
+    const id = await saveEvent(ev);
+    console.log(`[SAVED] id=${id} tipo=${ev.tipo} cliente=${ev.cliente_nome} modelo=${ev.modelo}`);
+
+    if (REPLY_ON_GROUP && id) {
+      const parts = [];
+      parts.push(`✅ Registrado #${id}`);
+      if (ev.tipo) parts.push(`Tipo: *${ev.tipo}*`);
+      if (ev.cliente_nome) {
+        const suffix = gesprov?.nome ? " ✓" : "";
+        parts.push(`Cliente: ${ev.cliente_nome}${suffix}`);
+      }
+      if (ev.cliente_cpf) parts.push(`CPF: ${ev.cliente_cpf}`);
+      if (ev.cliente_login) parts.push(`Login: ${ev.cliente_login}`);
+      if (gesprov?.plano) parts.push(`Plano: ${gesprov.plano} (${gesprov.situacao || "?"})`);
+      if (gesprov?.endereco) parts.push(`Endereço: ${gesprov.endereco}`);
+      if (ev.fabricante || ev.modelo) parts.push(`${[ev.fabricante, ev.modelo].filter(Boolean).join(" ")}`);
+      if (ev.serial) parts.push(`SN: \`${ev.serial}\``);
+      if (ev.mac) parts.push(`MAC: \`${ev.mac}\``);
+      if (acsInfo?.device_id) {
+        const last = acsInfo.last_inform ? new Date(acsInfo.last_inform).toLocaleString("pt-BR") : "?";
+        parts.push(`ACS: _já provisionado (último inform ${last})_`);
+      }
+      if (ev.observacoes) parts.push(`Obs: ${ev.observacoes}`);
+      if (msgs.length > 1) parts.push(`_📎 consolidado de ${msgs.length} mensagens_`);
+      if (ev.cliente_nome && !ev.cliente_cpf && !ev.cliente_login) {
+        parts.push(`\n💡 _Dica: inclua CPF ou login PPPoE pra enriquecer com dados do sistema._`);
+      }
+      await wppSendText(CHAT_ID, parts.join("\n"));
+    }
+  } catch (e) { console.error("save fail:", e.message); }
+}
+
+// Variante do geminiExtract que aceita array de imagens e audios (batch consolidado)
+async function geminiExtractBatch({ text, images, audios }) {
+  if (!GEMINI_KEY) throw new Error("GEMINI_KEY ausente");
+  const parts = [{ text: PROMPT }];
+  if (text) parts.push({ text: `\n\nTexto(s) da(s) mensagem(s):\n${text}` });
+  for (const img of (images || [])) {
+    if (img.imageBase64) parts.push({ inline_data: { mime_type: img.imageMime || "image/jpeg", data: img.imageBase64 } });
+  }
+  for (const au of (audios || [])) {
+    if (au.audioBase64) parts.push({ inline_data: { mime_type: au.audioMime || "audio/ogg", data: au.audioBase64 } });
+  }
+
+  const models = [GEMINI_MODEL, "gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash"];
+  const seen = new Set();
+  const body = {
+    contents: [{ parts }],
+    generationConfig: { temperature: 0.1, responseMimeType: "application/json" },
+  };
+  for (const model of models) {
+    if (seen.has(model)) continue;
+    seen.add(model);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`;
+      try {
+        const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (j.error) {
+          console.error(`[GEMINI ERR] model=${model} try=${attempt} code=${j.error.code}: ${String(j.error.message).slice(0,120)}`);
+          if (j.error.code === 503 && attempt === 1) { await new Promise(r => setTimeout(r, 1500)); continue; }
+          break;
+        }
+        const raw = j.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+        console.log(`[GEMINI OK] model=${model} raw=${raw.slice(0,120)}`);
+        try { return { raw, parsed: JSON.parse(raw) }; }
+        catch (e) { console.error(`[GEMINI parse fail] ${e.message}`); return { raw, parsed: {} }; }
+      } catch (e) { console.error(`[GEMINI net err] model=${model} try=${attempt}: ${e.message}`); }
+    }
+  }
+  return { raw: "{}", parsed: {} };
+}
+
 app.post("/webhook", async (req, res) => {
   res.json({ ok: true });
   const data = req.body || {};
@@ -319,7 +468,7 @@ app.post("/webhook", async (req, res) => {
   const from = msg.from || msg.chatId || "";
 
   if (event !== "onmessage" && event !== "unreadmessages") return;
-  if (from !== CHAT_ID) return; // so escuta o grupo alvo
+  if (from !== CHAT_ID) return;
 
   const messageId = msg.id || msg.messageId || `${from}_${msg.timestamp || Date.now()}`;
   const tecnicoNumero = msg.sender?.id?._serialized || msg.sender?.id || msg.author || "";
@@ -377,85 +526,16 @@ app.post("/webhook", async (req, res) => {
   const shouldProcess = isImage || isAudio || /instala|troca|manuten|recolh|onu|ont|roteador/i.test(text);
   if (!shouldProcess) return;
 
-  let ai = { raw: null, parsed: {} };
-  try {
-    ai = await geminiExtract({ text, imageBase64, imageMime, audioBase64, audioMime });
-  } catch (e) { console.error("gemini fail:", e.message); }
-
-  const p = ai.parsed || {};
-
-  // Filtro de ruido: comprovantes, selfies, memes, etc
-  if (p.ignorar === true) {
-    console.log(`[IGNORADO] motivo=${p.motivo_ignorar || "?"} text="${text.slice(0,60)}"`);
-    return; // nao salva, nao responde
+  // Enfileira e agenda processamento debounced (60s desde ultima msg do tecnico)
+  const queueItem = { messageId, text, imageBase64, imageMime, fotoFilename, audioBase64, audioMime, audioFilename };
+  let entry = pending.get(tecnicoNumero);
+  if (!entry) {
+    entry = { msgs: [], timer: null, tecnico_nome: tecnicoNome };
+    pending.set(tecnicoNumero, entry);
   }
-
-  // Gesprov lookup: prioriza CPF, login, depois nome (nome pode nao retornar)
-  let gesprov = null;
-  for (const q of [p.cliente_cpf, p.cliente_login].filter(Boolean)) {
-    gesprov = await gesprovLookup(q);
-    if (gesprov?.nome) break;
-  }
-
-  // GenieACS lookup: busca CPE pelo serial/mac
-  const macNorm = normalizeMac(p.mac);
-  let acsInfo = null;
-  if (p.serial || macNorm) acsInfo = await genieacsLookup({ serial: p.serial, mac: macNorm });
-
-  const ev = {
-    message_id: messageId,
-    chat_id: from,
-    tecnico_numero: tecnicoNumero,
-    tecnico_nome: tecnicoNome,
-    raw_text: text,
-    tipo: p.tipo || null,
-    // Gesprov tem prioridade no nome/cpf (dados oficiais)
-    cliente_nome: gesprov?.nome || p.cliente_nome || null,
-    cliente_cpf: gesprov?.cpf || p.cliente_cpf || null,
-    cliente_login: p.cliente_login || null,
-    equipamento: p.equipamento || null,
-    fabricante: p.fabricante || null,
-    modelo: p.modelo || null,
-    serial: p.serial || null,
-    mac: macNorm || null,
-    equip_anterior: p.equip_anterior || null,
-    observacoes: p.observacoes || null,
-    foto_filename: fotoFilename,
-    foto_mime: imageMime,
-    ai_raw_json: { ...ai.parsed, _genieacs: acsInfo },
-    gesprov_cliente: gesprov,
-  };
-
-  try {
-    const id = await saveEvent(ev);
-    console.log(`[SAVED] id=${id} tipo=${ev.tipo} cliente=${ev.cliente_nome} modelo=${ev.modelo}`);
-
-    if (REPLY_ON_GROUP && id) {
-      const parts = [];
-      parts.push(`✅ Registrado #${id}`);
-      if (ev.tipo) parts.push(`Tipo: *${ev.tipo}*`);
-      if (ev.cliente_nome) {
-        const suffix = gesprov?.nome ? " ✓" : "";
-        parts.push(`Cliente: ${ev.cliente_nome}${suffix}`);
-      }
-      if (ev.cliente_cpf) parts.push(`CPF: ${ev.cliente_cpf}`);
-      if (ev.cliente_login) parts.push(`Login: ${ev.cliente_login}`);
-      if (gesprov?.plano) parts.push(`Plano: ${gesprov.plano} (${gesprov.situacao || "?"})`);
-      if (gesprov?.endereco) parts.push(`Endereço: ${gesprov.endereco}`);
-      if (ev.fabricante || ev.modelo) parts.push(`${[ev.fabricante, ev.modelo].filter(Boolean).join(" ")}`);
-      if (ev.serial) parts.push(`SN: \`${ev.serial}\``);
-      if (ev.mac) parts.push(`MAC: \`${ev.mac}\``);
-      if (acsInfo?.device_id) {
-        const last = acsInfo.last_inform ? new Date(acsInfo.last_inform).toLocaleString("pt-BR") : "?";
-        parts.push(`ACS: _já provisionado (último inform ${last})_`);
-      }
-      if (ev.observacoes) parts.push(`Obs: ${ev.observacoes}`);
-      if (ev.cliente_nome && !ev.cliente_cpf && !ev.cliente_login) {
-        parts.push(`\n💡 _Dica: inclua CPF ou login PPPoE pra enriquecer com dados do sistema._`);
-      }
-      await wppSendText(CHAT_ID, parts.join("\n"));
-    }
-  } catch (e) { console.error("save fail:", e.message); }
+  entry.msgs.push(queueItem);
+  console.log(`[QUEUE] ${tecnicoNumero}: ${entry.msgs.length} msgs na fila (processa em ${DEBOUNCE_MS/1000}s apos ultima)`);
+  scheduleProcess(tecnicoNumero, tecnicoNome);
 });
 
 app.listen(PORT, () => console.log(`tecnicos-bot worker listening on :${PORT}`));
